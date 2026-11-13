@@ -8,7 +8,7 @@ URL = (
     "securities/{secid}/candles.json"
 )
 
-TARGET_DATE = "2026-11-13"
+TARGET_DATE = "2026-11-12"
 INTERVAL = 10
 PAGE_SIZE = 500
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -23,7 +23,7 @@ def fetch_candles(secid):
         params = {
             "interval": INTERVAL,
             "from": TARGET_DATE,
-            "till": "2026-11-14",
+            "till": "2026-11-13",
             "start": start,
             "limit": PAGE_SIZE,
             "iss.meta": "off",
