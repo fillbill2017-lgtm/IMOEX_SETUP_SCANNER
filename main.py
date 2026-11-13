@@ -1,21 +1,21 @@
 
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from collections import Counter
 
 URL = (
     "https://iss.moex.com/iss/engines/stock/markets/index/"
-    "securities/{secid}/candles.json"
+    "securities/IMOEX/candles.json"
 )
 
 TARGET_DATE = "2026-11-12"
 INTERVAL = 10
-PAGE_SIZE = 500
 MOSCOW = ZoneInfo("Europe/Moscow")
 
 
-def fetch_candles(secid):
-    all_rows = []
+def fetch_data():
+    rows_all = []
     columns = None
     start = 0
 
@@ -25,185 +25,133 @@ def fetch_candles(secid):
             "from": TARGET_DATE,
             "till": TARGET_DATE,
             "start": start,
-            "limit": PAGE_SIZE,
+            "limit": 500,
             "iss.meta": "off",
         }
 
-        response = requests.get(
-            URL.format(secid=secid),
-            params=params,
-            timeout=30,
-        )
+        response = requests.get(URL, params=params, timeout=30)
         response.raise_for_status()
 
-        candle_data = response.json().get("candles", {})
-        page_columns = candle_data.get("columns", [])
-        rows = candle_data.get("data", [])
+        block = response.json()["candles"]
+        page_columns = block["columns"]
+        rows = block["data"]
 
         if columns is None:
             columns = page_columns
-        elif columns != page_columns:
-            raise ValueError("Изменился состав полей MOEX ISS")
 
         if not rows:
             break
 
-        all_rows.extend(rows)
+        rows_all.extend(rows)
         start += len(rows)
 
-        if len(rows) < PAGE_SIZE:
+        if len(rows) < 500:
             break
 
-    return columns or [], all_rows
-
-
-def parse_time(value):
-    dt = datetime.fromisoformat(str(value))
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=MOSCOW)
-
-    return dt.astimezone(MOSCOW)
-
-
-def inspect_security(secid):
-    print("\n" + "=" * 55)
-    print(f"ИНСТРУМЕНТ: {secid}")
-    print("=" * 55)
-
-    try:
-        columns, rows = fetch_candles(secid)
-    except Exception as error:
-        print(f"ОШИБКА ЗАПРОСА: {error}")
-        return None
-
-    print("Поля MOEX ISS:", columns)
-
-    if not rows:
-        print("Свечи не получены.")
-        return []
-
-    candles = []
-
-    for index, row in enumerate(rows):
-        record = dict(zip(columns, row))
-
-        try:
-            candle = {
-                "time": parse_time(record["begin"]),
-                "open": float(record["open"]),
-                "high": float(record["high"]),
-                "low": float(record["low"]),
-                "close": float(record["close"]),
-            }
-        except Exception as error:
-            raise ValueError(
-                f"Ошибка строки {index}: {record}; {error}"
-            ) from error
-
-        candles.append(candle)
-
-    candles.sort(key=lambda x: x["time"])
-
-    # Защита от попадания чужой даты в результат
-    candles = [
-        c for c in candles
-        if c["time"].strftime("%Y-%m-%d") == TARGET_DATE
-    ]
-
-    print(f"Дата проверки: {TARGET_DATE}")
-    print(f"Свечей за этот день: {len(candles)}")
-
-    if not candles:
-        return []
-
-    print(f"Первая свеча: {candles[0]['time']}")
-    print(f"Последняя свеча: {candles[-1]['time']}")
-
-    periods = {
-        "До 10:00": lambda t: t.hour < 10,
-        "10:00–18:00": lambda t: 10 <= t.hour < 18,
-        "18:00–19:00": lambda t: 18 <= t.hour < 19,
-        "19:00–23:59": lambda t: t.hour >= 19,
-    }
-
-    print("\nРаспределение свечей по времени:")
-
-    for name, condition in periods.items():
-        count = sum(condition(c["time"]) for c in candles)
-        print(f"{name}: {count}")
-
-    print("\nВсе свечи с 17:30 и позже:")
-
-    evening = [
-        c for c in candles
-        if c["time"].hour > 17
-        or (c["time"].hour == 17 and c["time"].minute >= 30)
-    ]
-
-    if not evening:
-        print("Нет свечей.")
-    else:
-        for c in evening:
-            print(
-                f"{c['time']:%H:%M} | "
-                f"O:{c['open']} H:{c['high']} "
-                f"L:{c['low']} C:{c['close']}"
-            )
-
-    return candles
-
-
-def compare(first, second):
-    print("\n" + "=" * 55)
-    print("СРАВНЕНИЕ IMOEX И IMOEX2")
-    print("=" * 55)
-
-    if first is None or second is None:
-        print("Сравнение невозможно: ошибка запроса.")
-        return
-
-    first_map = {c["time"]: c for c in first}
-    second_map = {c["time"]: c for c in second}
-
-    first_times = set(first_map)
-    second_times = set(second_map)
-    common = sorted(first_times & second_times)
-
-    print(f"Свечей IMOEX: {len(first)}")
-    print(f"Свечей IMOEX2: {len(second)}")
-    print(f"Общих временных отметок: {len(common)}")
-    print(f"Только в IMOEX: {len(first_times - second_times)}")
-    print(f"Только в IMOEX2: {len(second_times - first_times)}")
-
-    differences = 0
-
-    for timestamp in common:
-        a = first_map[timestamp]
-        b = second_map[timestamp]
-
-        if any(
-            a[field] != b[field]
-            for field in ("open", "high", "low", "close")
-        ):
-            differences += 1
-            print(
-                f"РАЗЛИЧИЕ {timestamp:%H:%M}: "
-                f"IMOEX C:{a['close']} | IMOEX2 C:{b['close']}"
-            )
-
-    print(f"Свечей с различиями OHLC: {differences}")
+    return columns, rows_all
 
 
 def main():
-    print("ПРОВЕРКА MOEX ISS")
-    print(f"Дата: {TARGET_DATE}")
-    print(f"Интервал: {INTERVAL} минут")
+    print("КОНТРОЛЬ НЕПРЕРЫВНОСТИ IMOEX")
+    print("Дата:", TARGET_DATE)
 
-    imoex = inspect_security("IMOEX")
-    imoex2 = inspect_security("IMOEX2")
+    columns, rows = fetch_data()
+    print("Поля MOEX:", columns)
 
-    compare(imoex, imoex2)
+    candles = []
+
+    for row in rows:
+        r = dict(zip(columns, row))
+
+        time = datetime.fromisoformat(str(r["begin"]))
+        end = datetime.fromisoformat(str(r["end"]))
+
+        if time.tzinfo is None:
+            time = time.replace(tzinfo=MOSCOW)
+
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=MOSCOW)
+
+        candles.append({
+            "time": time.astimezone(MOSCOW),
+            "end": end.astimezone(MOSCOW),
+            "open": float(r["open"]),
+            "high": float(r["high"]),
+            "low": float(r["low"]),
+            "close": float(r["close"]),
+        })
+
+    candles.sort(key=lambda x: x["time"])
+
+    times = [c["time"] for c in candles]
+    counts = Counter(times)
+
+    duplicates = [
+        t for t, count in counts.items()
+        if count > 1
+    ]
+
+    gaps = []
+
+    for previous, current in zip(times, times[1:]):
+        difference = current - previous
+
+        if difference != timedelta(minutes=INTERVAL):
+            gaps.append((previous, current, difference))
+
+    invalid = []
+
+    for c in candles:
+        if not (
+            c["low"] <= c["open"] <= c["high"]
+            and c["low"] <= c["close"] <= c["high"]
+            and c["low"] <= c["high"]
+        ):
+            invalid.append(c)
+
+    flat = [
+        c for c in candles
+        if c["open"] == c["high"]
+        == c["low"] == c["close"]
+    ]
+
+    print("\n=== ОБЩИЕ РЕЗУЛЬТАТЫ ===")
+    print("Всего свечей:", len(candles))
+    print("Дубликатов:", len(duplicates))
+    print("Разрывов времени:", len(gaps))
+    print("Некорректных OHLC:", len(invalid))
+    print("Свечей с нулевым диапазоном:", len(flat))
+
+    if candles:
+        print("\nПервая свеча:")
+        print(candles[0])
+
+        print("\nПоследняя свеча:")
+        print(candles[-1])
+
+    if duplicates:
+        print("\nДубликаты:")
+        for t in duplicates:
+            print(t)
+
+    if gaps:
+        print("\nРазрывы:")
+        for previous, current, difference in gaps:
+            print(previous, "->", current, "|", difference)
+
+    if flat:
+        print("\nСвечи с нулевым диапазоном:")
+        for c in flat:
+            print(c)
+
+    print("\n=== ПОСЛЕДНИЕ 10 СВЕЧЕЙ ===")
+
+    for c in candles[-10:]:
+        print(
+            f"{c['time']:%H:%M} - {c['end']:%H:%M} | "
+            f"O:{c['open']} H:{c['high']} "
+            f"L:{c['low']} C:{c['close']}"
+        )
 
     print("\n=== ПРОВЕРКА ЗАВЕРШЕНА ===")
 
