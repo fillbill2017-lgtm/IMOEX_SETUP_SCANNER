@@ -10,7 +10,7 @@ URL = (
 
 PAGE_SIZE = 500
 LOOKBACK_DAYS = 30
-INTERVAL_MINUTES = 10
+INTERVAL = 10
 MOSCOW = ZoneInfo("Europe/Moscow")
 
 
@@ -19,23 +19,21 @@ def load_candles():
     date_from = now.date() - timedelta(days=LOOKBACK_DAYS)
 
     params = {
-        "interval": INTERVAL_MINUTES,
+        "interval": INTERVAL,
         "from": date_from.isoformat(),
         "till": now.date().isoformat(),
         "start": 0,
         "iss.meta": "off",
     }
 
-    candles = []
+    result = []
     start = 0
 
     while True:
         params["start"] = start
 
         response = requests.get(
-            URL,
-            params=params,
-            timeout=30
+            URL, params=params, timeout=30
         )
         response.raise_for_status()
 
@@ -47,9 +45,8 @@ def load_candles():
         if not rows:
             break
 
-        candles.extend(
-            dict(zip(columns, row))
-            for row in rows
+        result.extend(
+            dict(zip(columns, row)) for row in rows
         )
 
         start += len(rows)
@@ -57,54 +54,47 @@ def load_candles():
         if len(rows) < PAGE_SIZE:
             break
 
-    return candles, now
+    return result, now
 
 
-def validate_ohlc(candle):
+def valid_ohlc(c):
     try:
-        o = float(candle["open"])
-        h = float(candle["high"])
-        l = float(candle["low"])
-        c = float(candle["close"])
+        o = float(c["open"])
+        h = float(c["high"])
+        l = float(c["low"])
+        close = float(c["close"])
 
-        if min(o, h, l, c) <= 0:
-            return False
-
-        if h < max(o, l, c):
-            return False
-
-        if l > min(o, h, c):
-            return False
-
-        return True
-
+        return (
+            min(o, h, l, close) > 0
+            and h >= max(o, l, close)
+            and l <= min(o, h, close)
+        )
     except (ValueError, TypeError, KeyError):
         return False
 
 
-def build_30m_candles(candles):
+def build_30m(candles):
     groups = {}
 
-    for candle in candles:
-        timestamp = datetime.strptime(
-            candle["begin"],
-            "%Y-%m-%d %H:%M:%S"
+    for c in candles:
+        t = datetime.strptime(
+            c["begin"], "%Y-%m-%d %H:%M:%S"
         )
 
-        bucket_minute = (timestamp.minute // 30) * 30
-
+        bucket_minute = (t.minute // 30) * 30
         key = (
-            timestamp.strftime("%Y-%m-%d %H:")
+            t.strftime("%Y-%m-%d %H:")
             + f"{bucket_minute:02d}"
         )
 
-        groups.setdefault(key, []).append(candle)
+        groups.setdefault(key, []).append(c)
 
     result = []
     incomplete = 0
+    continuity_errors = 0
 
     for key, group in sorted(groups.items()):
-        group.sort(key=lambda item: item["begin"])
+        group.sort(key=lambda x: x["begin"])
 
         if len(group) != 3:
             incomplete += 1
@@ -112,158 +102,154 @@ def build_30m_candles(candles):
 
         times = [
             datetime.strptime(
-                item["begin"],
-                "%Y-%m-%d %H:%M:%S"
+                c["begin"], "%Y-%m-%d %H:%M:%S"
             )
-            for item in group
+            for c in group
         ]
 
-        if not (
-            times[1] - times[0] == timedelta(minutes=10)
-            and times[2] - times[1] == timedelta(minutes=10)
+        expected_start = datetime.strptime(
+            key, "%Y-%m-%d %H:%M"
+        )
+
+        if (
+            times[0] != expected_start
+            or times[1] - times[0] != timedelta(minutes=10)
+            or times[2] - times[1] != timedelta(minutes=10)
         ):
-            incomplete += 1
+            continuity_errors += 1
             continue
 
         result.append({
-            "begin": group[0]["begin"],
+            "begin": key + ":00",
             "open": float(group[0]["open"]),
             "high": max(float(x["high"]) for x in group),
             "low": min(float(x["low"]) for x in group),
             "close": float(group[-1]["close"]),
+            "source": group,
         })
 
-    return result, incomplete
+    return result, incomplete, continuity_errors
 
 
 def main():
     try:
         raw, now = load_candles()
 
-        print("=== КОНТРОЛЬ КАЧЕСТВА IMOEX ===")
+        print("=== IMOEX: КОНТРОЛЬ ИСХОДНЫХ ДАННЫХ ===")
         print("Получено строк:", len(raw))
 
-        if not raw:
-            print("Нет данных от MOEX ISS.")
-            return
-
-        required = {
-            "begin", "open", "high", "low", "close"
-        }
-
-        missing_fields = required.difference(raw[0].keys())
-
-        if missing_fields:
-            print("Отсутствуют поля:", sorted(missing_fields))
-            return
-
         timestamps = [
-            item.get("begin")
-            for item in raw
-            if item.get("begin")
+            c.get("begin") for c in raw if c.get("begin")
         ]
 
         duplicates = len(timestamps) - len(set(timestamps))
 
-        unique = {}
-
-        for candle in raw:
-            if candle.get("begin"):
-                unique[candle["begin"]] = candle
+        unique = {
+            c["begin"]: c
+            for c in raw
+            if c.get("begin")
+        }
 
         candles = sorted(
             unique.values(),
-            key=lambda item: item["begin"]
+            key=lambda x: x["begin"]
         )
 
         invalid = [
-            candle
-            for candle in candles
-            if not validate_ohlc(candle)
+            c for c in candles if not valid_ohlc(c)
         ]
 
         valid = [
-            candle
-            for candle in candles
-            if validate_ohlc(candle)
+            c for c in candles if valid_ohlc(c)
         ]
 
         completed = []
 
-        for candle in valid:
+        for c in valid:
             begin = datetime.strptime(
-                candle["begin"],
-                "%Y-%m-%d %H:%M:%S"
+                c["begin"], "%Y-%m-%d %H:%M:%S"
             ).replace(tzinfo=MOSCOW)
 
-            end = begin + timedelta(
-                minutes=INTERVAL_MINUTES
-            )
-
-            if end <= now:
-                completed.append(candle)
+            if begin + timedelta(minutes=INTERVAL) <= now:
+                completed.append(c)
 
         print("Дубликатов:", duplicates)
         print("Некорректных OHLC:", len(invalid))
-        print(
-            "Незакрытых свечей исключено:",
-            len(valid) - len(completed)
-        )
-        print(
-            "Закрытых уникальных свечей:",
-            len(completed)
-        )
+        print("Закрытых 10M:", len(completed))
+        print("Исключено незакрытых:", len(valid) - len(completed))
 
-        print("\nПоследние 10 закрытых свечей 10M:")
-
-        for candle in completed[-10:]:
-            print(
-                f"{candle['begin']} | "
-                f"O:{candle['open']} "
-                f"H:{candle['high']} "
-                f"L:{candle['low']} "
-                f"C:{candle['close']}"
-            )
-
-        candles_30m, incomplete = build_30m_candles(
+        bars_30m, incomplete, continuity_errors = build_30m(
             completed
         )
 
-        invalid_30m = [
-            candle
-            for candle in candles_30m
-            if not validate_ohlc(candle)
-        ]
+        print("\n=== IMOEX: АГРЕГАЦИЯ 30M ===")
+        print("Полных свечей:", len(bars_30m))
+        print("Неполных групп:", incomplete)
+        print("Ошибок последовательности:", continuity_errors)
 
-        print("\n=== АГРЕГАЦИЯ 30M ===")
-        print("Полноценных свечей:", len(candles_30m))
-        print("Неполных групп исключено:", incomplete)
-        print("Некорректных свечей 30M:", len(invalid_30m))
+        verification_errors = 0
 
-        print("\nПоследние 10 свечей 30M:")
+        for bar in bars_30m:
+            source = bar["source"]
 
-        for candle in candles_30m[-10:]:
+            expected = {
+                "open": float(source[0]["open"]),
+                "high": max(float(x["high"]) for x in source),
+                "low": min(float(x["low"]) for x in source),
+                "close": float(source[-1]["close"]),
+            }
+
+            for field, value in expected.items():
+                if abs(bar[field] - value) > 0.000001:
+                    verification_errors += 1
+
+        print("Ошибок сверки OHLC:", verification_errors)
+
+        print("\n=== ПОДРОБНАЯ СВЕРКА ПОСЛЕДНИХ 5 СВЕЧЕЙ ===")
+
+        for bar in bars_30m[-5:]:
+            print("\n30M:", bar["begin"])
             print(
-                f"{candle['begin']} | "
-                f"O:{candle['open']} "
-                f"H:{candle['high']} "
-                f"L:{candle['low']} "
-                f"C:{candle['close']}"
+                f"O:{bar['open']} "
+                f"H:{bar['high']} "
+                f"L:{bar['low']} "
+                f"C:{bar['close']}"
             )
 
-        if completed:
-            print("\nПервая 10M:", completed[0]["begin"])
-            print("Последняя 10M:", completed[-1]["begin"])
+            print("Исходные 10M:")
 
-        if candles_30m:
-            print("Первая 30M:", candles_30m[0]["begin"])
-            print("Последняя 30M:", candles_30m[-1]["begin"])
+            for c in bar["source"]:
+                print(
+                    f"  {c['begin']} | "
+                    f"O:{c['open']} "
+                    f"H:{c['high']} "
+                    f"L:{c['low']} "
+                    f"C:{c['close']}"
+                )
+
+        print("\n=== ИТОГ ===")
+
+        if (
+            duplicates == 0
+            and not invalid
+            and continuity_errors == 0
+            and verification_errors == 0
+        ):
+            print("Проверенные условия выполнены.")
+        else:
+            print("Обнаружены проблемы. Требуется разбор.")
+
+        if completed:
+            print("\nПоследняя 10M:", completed[-1]["begin"])
+
+        if bars_30m:
+            print("Последняя 30M:", bars_30m[-1]["begin"])
 
     except requests.RequestException as error:
-        print("Ошибка подключения к MOEX ISS:", error)
+        print("Ошибка MOEX ISS:", error)
 
     except (ValueError, KeyError, TypeError) as error:
-        print("Ошибка обработки данных:", error)
+        print("Ошибка обработки:", error)
 
 
 if __name__ == "__main__":
