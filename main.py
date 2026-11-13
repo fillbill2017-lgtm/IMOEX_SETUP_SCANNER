@@ -6,7 +6,7 @@ URL = "https://iss.moex.com/iss/engines/stock/markets/index/securities/IMOEX/can
 params = {
     "interval": 60,
     "start": 0,
-    "limit": 10,
+    "iss.reverse": 1,
     "iss.meta": "off",
 }
 
