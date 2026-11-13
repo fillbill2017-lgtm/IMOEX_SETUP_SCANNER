@@ -3,83 +3,131 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-URL = (
-    "https://iss.moex.com/iss/engines/stock/markets/index/"
-    "securities/IMOEX/candles.json"
-)
-
+BASE = "https://iss.moex.com/iss"
+TICKER = "MXZ6"
 TARGET_DATE = "2026-11-12"
 MOSCOW = ZoneInfo("Europe/Moscow")
 
+CANDLES_URL = (
+    f"{BASE}/engines/futures/markets/forts/"
+    f"boards/rfud/securities/{TICKER}/candles.json"
+)
 
-def fetch_data():
-    params = {
-        "interval": 10,
-        "from": TARGET_DATE,
-        "till": TARGET_DATE,
-        "start": 0,
-        "limit": 500,
-        "iss.meta": "off",
-    }
+SECURITY_URL = (
+    f"{BASE}/engines/futures/markets/forts/"
+    f"securities/{TICKER}.json"
+)
 
-    response = requests.get(URL, params=params, timeout=30)
+
+def request_json(url, params=None):
+    response = requests.get(
+        url,
+        params=params,
+        timeout=30
+    )
     response.raise_for_status()
+    return response.json()
 
-    data = response.json()["candles"]
-    columns = data["columns"]
-    rows = data["data"]
 
-    return [dict(zip(columns, row)) for row in rows]
+def fetch_candles():
+    result = []
+    start = 0
+
+    while True:
+        params = {
+            "interval": 10,
+            "from": TARGET_DATE,
+            "till": TARGET_DATE,
+            "start": start,
+            "limit": 500,
+            "iss.meta": "off",
+        }
+
+        data = request_json(CANDLES_URL, params)
+        block = data["candles"]
+
+        columns = block["columns"]
+        rows = block["data"]
+
+        if not rows:
+            break
+
+        result.extend(
+            dict(zip(columns, row))
+            for row in rows
+        )
+
+        start += len(rows)
+
+        if len(rows) < 500:
+            break
+
+    return result
+
+
+def print_table(block_name, block):
+    if block_name not in block:
+        print(f"\nБлок {block_name}: отсутствует")
+        return
+
+    data = block[block_name]
+
+    print(f"\n=== {block_name.upper()} ===")
+    print("Поля:", data["columns"])
+
+    for row in data["data"]:
+        print(dict(zip(data["columns"], row)))
 
 
 def main():
-    rows = fetch_data()
-
-    print("ПРОВЕРКА ОБЪЁМА И СТОИМОСТИ IMOEX")
+    print("ПРОВЕРКА ФЬЮЧЕРСА MIX")
+    print("Контракт:", TICKER)
     print("Дата:", TARGET_DATE)
-    print("Всего свечей:", len(rows))
 
-    zero_volume = 0
-    zero_value = 0
+    print("\n=== 1. СВЕЧИ ===")
 
-    for row in rows:
-        volume = float(row["volume"] or 0)
-        value = float(row["value"] or 0)
+    candles = fetch_candles()
 
-        if volume == 0:
-            zero_volume += 1
+    print("Получено свечей:", len(candles))
 
-        if value == 0:
-            zero_value += 1
+    if candles:
+        columns = list(candles[0].keys())
+        print("Поля:", columns)
 
-    print("\n=== ОБЩАЯ СТАТИСТИКА ===")
-    print("Свечей с нулевым volume:", zero_volume)
-    print("Свечей с нулевым value:", zero_value)
+        volumes = [
+            float(c["volume"] or 0)
+            for c in candles
+        ]
 
-    print("\n=== ПОСЛЕДНИЕ 15 СВЕЧЕЙ ===")
+        values = [
+            float(c["value"] or 0)
+            for c in candles
+        ]
 
-    for row in rows[-15:]:
-        time = datetime.fromisoformat(str(row["begin"]))
+        print("Суммарный volume:", sum(volumes))
+        print("Суммарный value:", sum(values))
+        print("Свечей с нулевым volume:",
+              sum(v == 0 for v in volumes))
 
-        if time.tzinfo is None:
-            time = time.replace(tzinfo=MOSCOW)
+        print("\nПоследние 10 свечей:")
 
-        print(
-            f"{time:%H:%M} | "
-            f"O:{row['open']} H:{row['high']} "
-            f"L:{row['low']} C:{row['close']} | "
-            f"Volume:{row['volume']} | "
-            f"Value:{row['value']}"
-        )
+        for c in candles[-10:]:
+            print(
+                f"{c['begin']} | "
+                f"O:{c['open']} "
+                f"H:{c['high']} "
+                f"L:{c['low']} "
+                f"C:{c['close']} | "
+                f"Volume:{c['volume']} | "
+                f"Value:{c['value']}"
+            )
 
-    print("\n=== СВЕЧИ С НУЛЕВЫМ ДИАПАЗОНОМ ===")
+    print("\n=== 2. СТАТИСТИКА ИНСТРУМЕНТА ===")
 
-    for row in rows:
-        if (
-            row["open"] == row["high"]
-            == row["low"] == row["close"]
-        ):
-            print(row)
+    security = request_json(SECURITY_URL)
+
+    print_table("securities", security)
+    print_table("marketdata", security)
 
     print("\n=== ПРОВЕРКА ЗАВЕРШЕНА ===")
 
