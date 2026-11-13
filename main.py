@@ -23,7 +23,7 @@ def fetch_candles(secid):
         params = {
             "interval": INTERVAL,
             "from": TARGET_DATE,
-            "till": "2026-11-13",
+            "till": TARGET_DATE,
             "start": start,
             "limit": PAGE_SIZE,
             "iss.meta": "off",
@@ -36,18 +36,14 @@ def fetch_candles(secid):
         )
         response.raise_for_status()
 
-        data = response.json()
-        candle_data = data.get("candles", {})
-
+        candle_data = response.json().get("candles", {})
         page_columns = candle_data.get("columns", [])
         rows = candle_data.get("data", [])
 
         if columns is None:
             columns = page_columns
         elif columns != page_columns:
-            raise ValueError(
-                f"{secid}: изменился состав полей MOEX ISS"
-            )
+            raise ValueError("Изменился состав полей MOEX ISS")
 
         if not rows:
             break
@@ -62,13 +58,7 @@ def fetch_candles(secid):
 
 
 def parse_time(value):
-    if isinstance(value, datetime):
-        dt = value
-    else:
-        if value is None:
-            raise ValueError("Время свечи отсутствует")
-
-        dt = datetime.fromisoformat(str(value))
+    dt = datetime.fromisoformat(str(value))
 
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=MOSCOW)
@@ -77,9 +67,9 @@ def parse_time(value):
 
 
 def inspect_security(secid):
-    print(f"\n{'=' * 55}")
+    print("\n" + "=" * 55)
     print(f"ИНСТРУМЕНТ: {secid}")
-    print(f"{'=' * 55}")
+    print("=" * 55)
 
     try:
         columns, rows = fetch_candles(secid)
@@ -87,26 +77,16 @@ def inspect_security(secid):
         print(f"ОШИБКА ЗАПРОСА: {error}")
         return None
 
+    print("Поля MOEX ISS:", columns)
+
     if not rows:
         print("Свечи не получены.")
-        print("Поля ответа:", columns)
         return []
-
-    print("Поля MOEX ISS:", columns)
 
     candles = []
 
     for index, row in enumerate(rows):
         record = dict(zip(columns, row))
-
-        required = ["begin", "open", "high", "low", "close"]
-        missing = [field for field in required if field not in record]
-
-        if missing:
-            raise ValueError(
-                f"{secid}: отсутствуют поля {missing}. "
-                f"Доступные поля: {columns}"
-            )
 
         try:
             candle = {
@@ -118,65 +98,77 @@ def inspect_security(secid):
             }
         except Exception as error:
             raise ValueError(
-                f"{secid}: ошибка обработки строки {index}: "
-                f"{record}. Причина: {error}"
+                f"Ошибка строки {index}: {record}; {error}"
             ) from error
 
         candles.append(candle)
 
     candles.sort(key=lambda x: x["time"])
 
-    times = [c["time"] for c in candles]
+    # Защита от попадания чужой даты в результат
+    candles = [
+        c for c in candles
+        if c["time"].strftime("%Y-%m-%d") == TARGET_DATE
+    ]
 
-    print(f"Получено свечей: {len(candles)}")
-    print(f"Первая свеча: {times[0]}")
-    print(f"Последняя свеча: {times[-1]}")
+    print(f"Дата проверки: {TARGET_DATE}")
+    print(f"Свечей за этот день: {len(candles)}")
 
-    after_17_30 = [
+    if not candles:
+        return []
+
+    print(f"Первая свеча: {candles[0]['time']}")
+    print(f"Последняя свеча: {candles[-1]['time']}")
+
+    periods = {
+        "До 10:00": lambda t: t.hour < 10,
+        "10:00–18:00": lambda t: 10 <= t.hour < 18,
+        "18:00–19:00": lambda t: 18 <= t.hour < 19,
+        "19:00–23:59": lambda t: t.hour >= 19,
+    }
+
+    print("\nРаспределение свечей по времени:")
+
+    for name, condition in periods.items():
+        count = sum(condition(c["time"]) for c in candles)
+        print(f"{name}: {count}")
+
+    print("\nВсе свечи с 17:30 и позже:")
+
+    evening = [
         c for c in candles
         if c["time"].hour > 17
         or (c["time"].hour == 17 and c["time"].minute >= 30)
     ]
 
-    after_18_00 = [
-        c for c in candles
-        if c["time"].hour >= 18
-    ]
-
-    print(f"Свечей с 17:30 включительно: {len(after_17_30)}")
-    print(f"Свечей с 18:00 включительно: {len(after_18_00)}")
-
-    print("\nПоследние 15 свечей:")
-
-    for c in candles[-15:]:
-        print(
-            f"{c['time']:%Y-%m-%d %H:%M} | "
-            f"O:{c['open']} "
-            f"H:{c['high']} "
-            f"L:{c['low']} "
-            f"C:{c['close']}"
-        )
+    if not evening:
+        print("Нет свечей.")
+    else:
+        for c in evening:
+            print(
+                f"{c['time']:%H:%M} | "
+                f"O:{c['open']} H:{c['high']} "
+                f"L:{c['low']} C:{c['close']}"
+            )
 
     return candles
 
 
 def compare(first, second):
-    print(f"\n{'=' * 55}")
+    print("\n" + "=" * 55)
     print("СРАВНЕНИЕ IMOEX И IMOEX2")
-    print(f"{'=' * 55}")
+    print("=" * 55)
 
     if first is None or second is None:
-        print("Сравнение невозможно: ошибка одного из запросов.")
+        print("Сравнение невозможно: ошибка запроса.")
         return
 
-    if not first or not second:
-        print("У одного из инструментов нет свечей.")
-        return
+    first_map = {c["time"]: c for c in first}
+    second_map = {c["time"]: c for c in second}
 
-    first_times = {c["time"] for c in first}
-    second_times = {c["time"] for c in second}
-
-    common = first_times & second_times
+    first_times = set(first_map)
+    second_times = set(second_map)
+    common = sorted(first_times & second_times)
 
     print(f"Свечей IMOEX: {len(first)}")
     print(f"Свечей IMOEX2: {len(second)}")
@@ -184,25 +176,28 @@ def compare(first, second):
     print(f"Только в IMOEX: {len(first_times - second_times)}")
     print(f"Только в IMOEX2: {len(second_times - first_times)}")
 
-    first_map = {c["time"]: c for c in first}
-    second_map = {c["time"]: c for c in second}
+    differences = 0
 
-    print("\nПоследние 10 общих свечей:")
-
-    for timestamp in sorted(common)[-10:]:
+    for timestamp in common:
         a = first_map[timestamp]
         b = second_map[timestamp]
 
-        print(
-            f"{timestamp:%H:%M} | "
-            f"IMOEX C:{a['close']} | "
-            f"IMOEX2 C:{b['close']}"
-        )
+        if any(
+            a[field] != b[field]
+            for field in ("open", "high", "low", "close")
+        ):
+            differences += 1
+            print(
+                f"РАЗЛИЧИЕ {timestamp:%H:%M}: "
+                f"IMOEX C:{a['close']} | IMOEX2 C:{b['close']}"
+            )
+
+    print(f"Свечей с различиями OHLC: {differences}")
 
 
 def main():
     print("ПРОВЕРКА MOEX ISS")
-    print(f"Дата проверки: {TARGET_DATE}")
+    print(f"Дата: {TARGET_DATE}")
     print(f"Интервал: {INTERVAL} минут")
 
     imoex = inspect_security("IMOEX")
