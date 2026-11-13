@@ -1,255 +1,184 @@
 
 import requests
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 URL = (
-    "https://iss.moex.com/iss/engines/stock/"
-    "markets/index/securities/IMOEX/candles.json"
+    "https://iss.moex.com/iss/engines/stock/markets/index/"
+    "securities/{secid}/candles.json"
 )
 
-PAGE_SIZE = 500
-LOOKBACK_DAYS = 30
+TARGET_DATE = "2026-11-13"
 INTERVAL = 10
+PAGE_SIZE = 500
 MOSCOW = ZoneInfo("Europe/Moscow")
 
 
-def load_candles():
-    now = datetime.now(MOSCOW)
-    date_from = now.date() - timedelta(days=LOOKBACK_DAYS)
-
-    params = {
-        "interval": INTERVAL,
-        "from": date_from.isoformat(),
-        "till": now.date().isoformat(),
-        "start": 0,
-        "iss.meta": "off",
-    }
-
-    result = []
+def fetch_candles(secid):
+    """Получает все 10-минутные свечи за заданную дату."""
+    all_rows = []
     start = 0
 
     while True:
-        params["start"] = start
+        params = {
+            "interval": INTERVAL,
+            "from": TARGET_DATE,
+            "till": "2026-11-14",
+            "start": start,
+            "limit": PAGE_SIZE,
+            "iss.meta": "off",
+        }
 
         response = requests.get(
-            URL, params=params, timeout=30
+            URL.format(secid=secid),
+            params=params,
+            timeout=30,
         )
         response.raise_for_status()
 
-        payload = response.json()
-        block = payload.get("candles", {})
-        columns = block.get("columns", [])
-        rows = block.get("data", [])
+        data = response.json()
+        rows = data.get("candles", {}).get("data", [])
 
         if not rows:
             break
 
-        result.extend(
-            dict(zip(columns, row)) for row in rows
-        )
-
+        all_rows.extend(rows)
         start += len(rows)
 
         if len(rows) < PAGE_SIZE:
             break
 
-    return result, now
+    return all_rows
 
 
-def valid_ohlc(c):
+def parse_time(value):
+    dt = datetime.fromisoformat(value)
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=MOSCOW)
+
+    return dt.astimezone(MOSCOW)
+
+
+def inspect_security(secid):
+    print(f"\n{'=' * 55}")
+    print(f"ИНСТРУМЕНТ: {secid}")
+    print(f"{'=' * 55}")
+
     try:
-        o = float(c["open"])
-        h = float(c["high"])
-        l = float(c["low"])
-        close = float(c["close"])
+        rows = fetch_candles(secid)
+    except Exception as error:
+        print(f"ОШИБКА ЗАПРОСА: {error}")
+        return None
 
-        return (
-            min(o, h, l, close) > 0
-            and h >= max(o, l, close)
-            and l <= min(o, h, close)
-        )
-    except (ValueError, TypeError, KeyError):
-        return False
+    if not rows:
+        print("Свечи не получены.")
+        return []
 
+    candles = []
 
-def build_30m(candles):
-    groups = {}
+    for row in rows:
+        begin, open_, high, low, close, volume = row[:6]
 
-    for c in candles:
-        t = datetime.strptime(
-            c["begin"], "%Y-%m-%d %H:%M:%S"
-        )
-
-        bucket_minute = (t.minute // 30) * 30
-        key = (
-            t.strftime("%Y-%m-%d %H:")
-            + f"{bucket_minute:02d}"
-        )
-
-        groups.setdefault(key, []).append(c)
-
-    result = []
-    incomplete = 0
-    continuity_errors = 0
-
-    for key, group in sorted(groups.items()):
-        group.sort(key=lambda x: x["begin"])
-
-        if len(group) != 3:
-            incomplete += 1
-            continue
-
-        times = [
-            datetime.strptime(
-                c["begin"], "%Y-%m-%d %H:%M:%S"
-            )
-            for c in group
-        ]
-
-        expected_start = datetime.strptime(
-            key, "%Y-%m-%d %H:%M"
-        )
-
-        if (
-            times[0] != expected_start
-            or times[1] - times[0] != timedelta(minutes=10)
-            or times[2] - times[1] != timedelta(minutes=10)
-        ):
-            continuity_errors += 1
-            continue
-
-        result.append({
-            "begin": key + ":00",
-            "open": float(group[0]["open"]),
-            "high": max(float(x["high"]) for x in group),
-            "low": min(float(x["low"]) for x in group),
-            "close": float(group[-1]["close"]),
-            "source": group,
+        candles.append({
+            "time": parse_time(begin),
+            "open": float(open_),
+            "high": float(high),
+            "low": float(low),
+            "close": float(close),
         })
 
-    return result, incomplete, continuity_errors
+    candles.sort(key=lambda x: x["time"])
+
+    times = [c["time"] for c in candles]
+
+    print(f"Получено свечей: {len(candles)}")
+    print(f"Первая свеча: {times[0]}")
+    print(f"Последняя свеча: {times[-1]}")
+
+    after_17_30 = [
+        c for c in candles
+        if c["time"].hour > 17
+        or (c["time"].hour == 17 and c["time"].minute >= 30)
+    ]
+
+    after_18_00 = [
+        c for c in candles
+        if c["time"].hour >= 18
+    ]
+
+    print(f"Свечей с 17:30 включительно: {len(after_17_30)}")
+    print(f"Свечей с 18:00 включительно: {len(after_18_00)}")
+
+    print("\nПоследние 15 свечей:")
+
+    for c in candles[-15:]:
+        print(
+            f"{c['time']:%Y-%m-%d %H:%M} | "
+            f"O:{c['open']} "
+            f"H:{c['high']} "
+            f"L:{c['low']} "
+            f"C:{c['close']}"
+        )
+
+    return candles
+
+
+def compare(first, second):
+    print(f"\n{'=' * 55}")
+    print("СРАВНЕНИЕ IMOEX И IMOEX2")
+    print(f"{'=' * 55}")
+
+    if first is None or second is None:
+        print("Сравнение невозможно: ошибка одного из запросов.")
+        return
+
+    if not first or not second:
+        print("У одного из инструментов нет свечей.")
+        return
+
+    first_times = {c["time"] for c in first}
+    second_times = {c["time"] for c in second}
+
+    common = first_times & second_times
+
+    print(f"Свечей IMOEX: {len(first)}")
+    print(f"Свечей IMOEX2: {len(second)}")
+    print(f"Общих временных отметок: {len(common)}")
+
+    only_first = first_times - second_times
+    only_second = second_times - first_times
+
+    print(f"Только в IMOEX: {len(only_first)}")
+    print(f"Только в IMOEX2: {len(only_second)}")
+
+    first_map = {c["time"]: c for c in first}
+    second_map = {c["time"]: c for c in second}
+
+    print("\nПоследние 10 общих свечей:")
+
+    for timestamp in sorted(common)[-10:]:
+        a = first_map[timestamp]
+        b = second_map[timestamp]
+
+        print(
+            f"{timestamp:%H:%M} | "
+            f"IMOEX C:{a['close']} | "
+            f"IMOEX2 C:{b['close']}"
+        )
 
 
 def main():
-    try:
-        raw, now = load_candles()
+    print("ПРОВЕРКА MOEX ISS")
+    print(f"Дата проверки: {TARGET_DATE}")
+    print(f"Интервал: {INTERVAL} минут")
 
-        print("=== IMOEX: КОНТРОЛЬ ИСХОДНЫХ ДАННЫХ ===")
-        print("Получено строк:", len(raw))
+    imoex = inspect_security("IMOEX")
+    imoex2 = inspect_security("IMOEX2")
 
-        timestamps = [
-            c.get("begin") for c in raw if c.get("begin")
-        ]
+    compare(imoex, imoex2)
 
-        duplicates = len(timestamps) - len(set(timestamps))
-
-        unique = {
-            c["begin"]: c
-            for c in raw
-            if c.get("begin")
-        }
-
-        candles = sorted(
-            unique.values(),
-            key=lambda x: x["begin"]
-        )
-
-        invalid = [
-            c for c in candles if not valid_ohlc(c)
-        ]
-
-        valid = [
-            c for c in candles if valid_ohlc(c)
-        ]
-
-        completed = []
-
-        for c in valid:
-            begin = datetime.strptime(
-                c["begin"], "%Y-%m-%d %H:%M:%S"
-            ).replace(tzinfo=MOSCOW)
-
-            if begin + timedelta(minutes=INTERVAL) <= now:
-                completed.append(c)
-
-        print("Дубликатов:", duplicates)
-        print("Некорректных OHLC:", len(invalid))
-        print("Закрытых 10M:", len(completed))
-        print("Исключено незакрытых:", len(valid) - len(completed))
-
-        bars_30m, incomplete, continuity_errors = build_30m(
-            completed
-        )
-
-        print("\n=== IMOEX: АГРЕГАЦИЯ 30M ===")
-        print("Полных свечей:", len(bars_30m))
-        print("Неполных групп:", incomplete)
-        print("Ошибок последовательности:", continuity_errors)
-
-        verification_errors = 0
-
-        for bar in bars_30m:
-            source = bar["source"]
-
-            expected = {
-                "open": float(source[0]["open"]),
-                "high": max(float(x["high"]) for x in source),
-                "low": min(float(x["low"]) for x in source),
-                "close": float(source[-1]["close"]),
-            }
-
-            for field, value in expected.items():
-                if abs(bar[field] - value) > 0.000001:
-                    verification_errors += 1
-
-        print("Ошибок сверки OHLC:", verification_errors)
-
-        print("\n=== ПОДРОБНАЯ СВЕРКА ПОСЛЕДНИХ 5 СВЕЧЕЙ ===")
-
-        for bar in bars_30m[-5:]:
-            print("\n30M:", bar["begin"])
-            print(
-                f"O:{bar['open']} "
-                f"H:{bar['high']} "
-                f"L:{bar['low']} "
-                f"C:{bar['close']}"
-            )
-
-            print("Исходные 10M:")
-
-            for c in bar["source"]:
-                print(
-                    f"  {c['begin']} | "
-                    f"O:{c['open']} "
-                    f"H:{c['high']} "
-                    f"L:{c['low']} "
-                    f"C:{c['close']}"
-                )
-
-        print("\n=== ИТОГ ===")
-
-        if (
-            duplicates == 0
-            and not invalid
-            and continuity_errors == 0
-            and verification_errors == 0
-        ):
-            print("Проверенные условия выполнены.")
-        else:
-            print("Обнаружены проблемы. Требуется разбор.")
-
-        if completed:
-            print("\nПоследняя 10M:", completed[-1]["begin"])
-
-        if bars_30m:
-            print("Последняя 30M:", bars_30m[-1]["begin"])
-
-    except requests.RequestException as error:
-        print("Ошибка MOEX ISS:", error)
-
-    except (ValueError, KeyError, TypeError) as error:
-        print("Ошибка обработки:", error)
+    print("\n=== ПРОВЕРКА ЗАВЕРШЕНА ===")
 
 
 if __name__ == "__main__":
