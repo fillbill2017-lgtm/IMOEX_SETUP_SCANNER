@@ -1,68 +1,62 @@
 
 import requests
-import json
 
-BASE_URL = "https://iss.moex.com/iss/analyticalproducts/futoi/securities"
+URL = (
+    "https://iss.moex.com/iss/analyticalproducts/"
+    "futoi/securities/mx.json"
+)
 
-TARGET_DATE = "2026-11-12"
-TICKER = "mx"
+TARGET_DATE = "2026-10-15"
 
 
 def main():
-    url = f"{BASE_URL}/{TICKER}.json"
-
     params = {
         "from": TARGET_DATE,
         "till": TARGET_DATE,
         "iss.meta": "off",
     }
 
-    print("ПРОВЕРКА ИСТОРИЧЕСКОГО OI MOEX")
-    print("Базовый актив:", TICKER.upper())
+    print("ПРОВЕРКА ИСТОРИЧЕСКОГО OI MIX")
     print("Дата:", TARGET_DATE)
-    print("URL:", url)
 
-    try:
-        response = requests.get(
-            url,
-            params=params,
-            timeout=30
-        )
+    response = requests.get(URL, params=params, timeout=30)
 
-        print("\nHTTP STATUS:", response.status_code)
-        print("Ответ сервера:", response.reason)
+    print("HTTP STATUS:", response.status_code)
+    response.raise_for_status()
 
-        response.raise_for_status()
+    result = response.json()
 
-        result = response.json()
+    section = result.get("futoi", {})
+    columns = section.get("columns", [])
+    rows = section.get("data", [])
 
-        print("\n=== РАЗДЕЛЫ ОТВЕТА ===")
-        print(list(result.keys()))
+    print("\n=== ПОЛЯ ===")
+    print(columns)
 
-        for section_name, section in result.items():
-            if not isinstance(section, dict):
-                continue
+    print("\n=== КОЛИЧЕСТВО ЗАПИСЕЙ ===")
+    print(len(rows))
 
-            columns = section.get("columns", [])
-            rows = section.get("data", [])
+    if columns == ["ERROR_MESSAGE"]:
+        print("\nОШИБКА MOEX:")
+        for row in rows:
+            print(row[0])
+        return
 
-            print(f"\n=== {section_name} ===")
-            print("Поля:", columns)
-            print("Количество строк:", len(rows))
+    if not rows:
+        print("\nДАННЫЕ НЕ ВОЗВРАЩЕНЫ")
+        return
 
-            for row in rows[:12]:
-                print(dict(zip(columns, row)))
+    print("\n=== ПЕРВЫЕ 20 ЗАПИСЕЙ ===")
 
-        print("\n=== ПОЛНЫЙ РЕЗУЛЬТАТ ===")
-        print(json.dumps(result, ensure_ascii=False)[:12000])
+    for row in rows[:20]:
+        print(dict(zip(columns, row)))
 
-    except requests.exceptions.HTTPError as error:
-        print("\nHTTP ОШИБКА:", error)
-        print("Тело ответа:")
-        print(response.text[:3000])
+    print("\n=== ПОСЛЕДНИЕ 10 ЗАПИСЕЙ ===")
 
-    except Exception as error:
-        print("\nОШИБКА:", repr(error))
+    for row in rows[-10:]:
+        print(dict(zip(columns, row)))
+
+    print("\n=== ПРОВЕРКА ЗАВЕРШЕНА ===")
 
 
 if __name__ == "__main__":
