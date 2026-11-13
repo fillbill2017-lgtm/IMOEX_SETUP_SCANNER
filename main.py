@@ -1,8 +1,7 @@
 
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
-from collections import Counter
 
 URL = (
     "https://iss.moex.com/iss/engines/stock/markets/index/"
@@ -10,148 +9,77 @@ URL = (
 )
 
 TARGET_DATE = "2026-11-12"
-INTERVAL = 10
 MOSCOW = ZoneInfo("Europe/Moscow")
 
 
 def fetch_data():
-    rows_all = []
-    columns = None
-    start = 0
+    params = {
+        "interval": 10,
+        "from": TARGET_DATE,
+        "till": TARGET_DATE,
+        "start": 0,
+        "limit": 500,
+        "iss.meta": "off",
+    }
 
-    while True:
-        params = {
-            "interval": INTERVAL,
-            "from": TARGET_DATE,
-            "till": TARGET_DATE,
-            "start": start,
-            "limit": 500,
-            "iss.meta": "off",
-        }
+    response = requests.get(URL, params=params, timeout=30)
+    response.raise_for_status()
 
-        response = requests.get(URL, params=params, timeout=30)
-        response.raise_for_status()
+    data = response.json()["candles"]
+    columns = data["columns"]
+    rows = data["data"]
 
-        block = response.json()["candles"]
-        page_columns = block["columns"]
-        rows = block["data"]
-
-        if columns is None:
-            columns = page_columns
-
-        if not rows:
-            break
-
-        rows_all.extend(rows)
-        start += len(rows)
-
-        if len(rows) < 500:
-            break
-
-    return columns, rows_all
+    return [dict(zip(columns, row)) for row in rows]
 
 
 def main():
-    print("КОНТРОЛЬ НЕПРЕРЫВНОСТИ IMOEX")
+    rows = fetch_data()
+
+    print("ПРОВЕРКА ОБЪЁМА И СТОИМОСТИ IMOEX")
     print("Дата:", TARGET_DATE)
+    print("Всего свечей:", len(rows))
 
-    columns, rows = fetch_data()
-    print("Поля MOEX:", columns)
-
-    candles = []
+    zero_volume = 0
+    zero_value = 0
 
     for row in rows:
-        r = dict(zip(columns, row))
+        volume = float(row["volume"] or 0)
+        value = float(row["value"] or 0)
 
-        time = datetime.fromisoformat(str(r["begin"]))
-        end = datetime.fromisoformat(str(r["end"]))
+        if volume == 0:
+            zero_volume += 1
+
+        if value == 0:
+            zero_value += 1
+
+    print("\n=== ОБЩАЯ СТАТИСТИКА ===")
+    print("Свечей с нулевым volume:", zero_volume)
+    print("Свечей с нулевым value:", zero_value)
+
+    print("\n=== ПОСЛЕДНИЕ 15 СВЕЧЕЙ ===")
+
+    for row in rows[-15:]:
+        time = datetime.fromisoformat(str(row["begin"]))
 
         if time.tzinfo is None:
             time = time.replace(tzinfo=MOSCOW)
 
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=MOSCOW)
-
-        candles.append({
-            "time": time.astimezone(MOSCOW),
-            "end": end.astimezone(MOSCOW),
-            "open": float(r["open"]),
-            "high": float(r["high"]),
-            "low": float(r["low"]),
-            "close": float(r["close"]),
-        })
-
-    candles.sort(key=lambda x: x["time"])
-
-    times = [c["time"] for c in candles]
-    counts = Counter(times)
-
-    duplicates = [
-        t for t, count in counts.items()
-        if count > 1
-    ]
-
-    gaps = []
-
-    for previous, current in zip(times, times[1:]):
-        difference = current - previous
-
-        if difference != timedelta(minutes=INTERVAL):
-            gaps.append((previous, current, difference))
-
-    invalid = []
-
-    for c in candles:
-        if not (
-            c["low"] <= c["open"] <= c["high"]
-            and c["low"] <= c["close"] <= c["high"]
-            and c["low"] <= c["high"]
-        ):
-            invalid.append(c)
-
-    flat = [
-        c for c in candles
-        if c["open"] == c["high"]
-        == c["low"] == c["close"]
-    ]
-
-    print("\n=== ОБЩИЕ РЕЗУЛЬТАТЫ ===")
-    print("Всего свечей:", len(candles))
-    print("Дубликатов:", len(duplicates))
-    print("Разрывов времени:", len(gaps))
-    print("Некорректных OHLC:", len(invalid))
-    print("Свечей с нулевым диапазоном:", len(flat))
-
-    if candles:
-        print("\nПервая свеча:")
-        print(candles[0])
-
-        print("\nПоследняя свеча:")
-        print(candles[-1])
-
-    if duplicates:
-        print("\nДубликаты:")
-        for t in duplicates:
-            print(t)
-
-    if gaps:
-        print("\nРазрывы:")
-        for previous, current, difference in gaps:
-            print(previous, "->", current, "|", difference)
-
-    if flat:
-        print("\nСвечи с нулевым диапазоном:")
-        for c in flat:
-            print(c)
-
-    print("\n=== ПОСЛЕДНИЕ 10 СВЕЧЕЙ ===")
-
-    for c in candles[-10:]:
         print(
-            f"{c['time']:%H:%M} - {c['end']:%H:%M} | "
-            f"O:{c['open']} H:{c['high']} "
-            f"L:{c['low']} C:{c['close']}"
+            f"{time:%H:%M} | "
+            f"O:{row['open']} H:{row['high']} "
+            f"L:{row['low']} C:{row['close']} | "
+            f"Volume:{row['volume']} | "
+            f"Value:{row['value']}"
         )
+
+    print("\n=== СВЕЧИ С НУЛЕВЫМ ДИАПАЗОНОМ ===")
+
+    for row in rows:
+        if (
+            row["open"] == row["high"]
+            == row["low"] == row["close"]
+        ):
+            print(row)
 
     print("\n=== ПРОВЕРКА ЗАВЕРШЕНА ===")
 
