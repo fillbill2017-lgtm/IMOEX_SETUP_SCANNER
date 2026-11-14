@@ -147,10 +147,7 @@ def detect_pivots(bars, left=2, right=2, cross_sessions=False):
                     "price": bar["low"]
                 })
 
-    return sorted(
-        pivots,
-        key=lambda x: (x["time"], x["type"])
-    )
+    return sorted(pivots, key=lambda x: (x["time"], x["type"]))
 
 
 def classify_pivots(pivots):
@@ -204,9 +201,17 @@ def classify_market(pivots):
         state = "DOWNTREND"
         reason = "Последние два максимума и минимума понижаются"
 
+    elif lower_highs and higher_lows:
+        state = "COMPRESSION"
+        reason = "Максимумы снижаются, минимумы повышаются"
+
+    elif higher_highs and lower_lows:
+        state = "EXPANSION"
+        reason = "Максимумы повышаются, минимумы понижаются"
+
     else:
         state = "TRANSITION"
-        reason = "Направление максимумов и минимумов не совпадает или есть равные значения"
+        reason = "Есть равные значения или неоднозначная структура"
 
     return {
         "state": state,
@@ -252,7 +257,7 @@ def save_csv(filename, rows):
 
 
 def main():
-    print("АНАЛИЗ СТРУКТУРЫ MXZ6 — MARKET STATE V1.0")
+    print("АНАЛИЗ СТРУКТУРЫ MXZ6 — MARKET STATE V2.0")
 
     candles = load_candles()
     sessions = split_sessions(candles)
@@ -260,10 +265,14 @@ def main():
     print("Исходных свечей:", len(candles))
     print("Торговых сессий:", len(sessions))
 
-    for name, size in [("1H", 6), ("4H", 24)]:
-        bars = aggregate_sessions(sessions, size)
+    timeframes = [
+        ("30M", 3, False),
+        ("1H", 6, False),
+        ("4H", 24, True)
+    ]
 
-        cross_sessions = (name == "4H")
+    for name, size, cross_sessions in timeframes:
+        bars = aggregate_sessions(sessions, size)
 
         pivots = detect_pivots(
             bars,
@@ -285,6 +294,11 @@ def main():
         print("Всего баров:", len(bars))
         print("Полных:", complete_count)
         print("Неполных:", partial_count)
+        print(
+            "Режим поиска:",
+            "между сессиями разрешён" if cross_sessions
+            else "только внутри сессии"
+        )
         print("Максимумов:", sum(x["type"] == "HIGH" for x in pivots))
         print("Минимумов:", sum(x["type"] == "LOW" for x in pivots))
 
