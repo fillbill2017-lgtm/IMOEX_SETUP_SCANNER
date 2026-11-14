@@ -94,15 +94,12 @@ def detect_pivots(bars, left=2, right=2, cross_sessions=False):
     pivots = []
 
     if cross_sessions:
-        # 4H: все полные бары в общей хронологической последовательности.
         sequences = [[
             x for x in bars
             if x["is_complete"]
         ]]
     else:
-        # 1H: полные бары анализируются отдельно внутри каждой сессии.
         session_ids = sorted(set(x["session_id"] for x in bars))
-
         sequences = []
 
         for session_id in session_ids:
@@ -178,6 +175,71 @@ def classify_pivots(pivots):
     return pivots
 
 
+def classify_market(pivots):
+    highs = [p for p in pivots if p["type"] == "HIGH"]
+    lows = [p for p in pivots if p["type"] == "LOW"]
+
+    if len(highs) < 2 or len(lows) < 2:
+        return {
+            "state": "INSUFFICIENT_DATA",
+            "reason": "Нужно минимум два подтверждённых максимума и два минимума",
+            "highs": highs[-2:],
+            "lows": lows[-2:]
+        }
+
+    high_old, high_new = highs[-2], highs[-1]
+    low_old, low_new = lows[-2], lows[-1]
+
+    higher_highs = high_new["price"] > high_old["price"]
+    lower_highs = high_new["price"] < high_old["price"]
+
+    higher_lows = low_new["price"] > low_old["price"]
+    lower_lows = low_new["price"] < low_old["price"]
+
+    if higher_highs and higher_lows:
+        state = "UPTREND"
+        reason = "Последние два максимума и минимума повышаются"
+
+    elif lower_highs and lower_lows:
+        state = "DOWNTREND"
+        reason = "Последние два максимума и минимума понижаются"
+
+    else:
+        state = "TRANSITION"
+        reason = "Направление максимумов и минимумов не совпадает или есть равные значения"
+
+    return {
+        "state": state,
+        "reason": reason,
+        "highs": [high_old, high_new],
+        "lows": [low_old, low_new]
+    }
+
+
+def print_market_state(name, result):
+    print(f"\n===== СОСТОЯНИЕ РЫНКА {name} =====")
+    print("Классификация:", result["state"])
+    print("Причина:", result["reason"])
+
+    print("\nПоследние два максимума:")
+    for p in result["highs"]:
+        print(
+            p["time"],
+            p["price"],
+            p.get("structure", ""),
+            "| подтверждён:", p["confirmed_at"]
+        )
+
+    print("\nПоследние два минимума:")
+    for p in result["lows"]:
+        print(
+            p["time"],
+            p["price"],
+            p.get("structure", ""),
+            "| подтверждён:", p["confirmed_at"]
+        )
+
+
 def save_csv(filename, rows):
     if not rows:
         print("Нет данных:", filename)
@@ -190,7 +252,7 @@ def save_csv(filename, rows):
 
 
 def main():
-    print("АНАЛИЗ СТРУКТУРЫ MXZ6 — VERSION 2")
+    print("АНАЛИЗ СТРУКТУРЫ MXZ6 — MARKET STATE V1.0")
 
     candles = load_candles()
     sessions = split_sessions(candles)
@@ -211,6 +273,7 @@ def main():
         )
 
         pivots = classify_pivots(pivots)
+        market_state = classify_market(pivots)
 
         complete_count = sum(x["is_complete"] for x in bars)
         partial_count = len(bars) - complete_count
@@ -222,15 +285,12 @@ def main():
         print("Всего баров:", len(bars))
         print("Полных:", complete_count)
         print("Неполных:", partial_count)
-        print("Режим поиска:", 
-              "между сессиями разрешён" if cross_sessions
-              else "только внутри сессии")
-
         print("Максимумов:", sum(x["type"] == "HIGH" for x in pivots))
         print("Минимумов:", sum(x["type"] == "LOW" for x in pivots))
 
-        print("\nПоследние 15 экстремумов:")
+        print_market_state(name, market_state)
 
+        print("\nПоследние 15 экстремумов:")
         for p in pivots[-15:]:
             print(
                 p["time"],
