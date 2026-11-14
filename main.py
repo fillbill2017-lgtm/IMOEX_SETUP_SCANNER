@@ -2,6 +2,11 @@
 import requests
 import csv
 from datetime import datetime
+from statistics import median
+
+# =========================================================
+# НАСТРОЙКИ
+# =========================================================
 
 SECID = "MXZ6"
 DATE_FROM = "2026-10-01"
@@ -9,9 +14,26 @@ DATE_TILL = "2026-11-13"
 
 URL = (
     "https://iss.moex.com/iss/engines/futures/markets/forts/"
-    "boards/rfud/securities/MXZ6/candles.json"
+    f"boards/rfud/securities/{SECID}/candles.json"
 )
 
+LEFT = 2
+RIGHT = 2
+
+ATR_PERIOD = 14
+EMA_FAST = 20
+EMA_SLOW = 50
+RSI_PERIOD = 14
+VOLUME_PERIOD = 20
+
+# Начальное тестовое допущение.
+ZONE_ATR_FACTOR = 0.25
+MIN_ZONE_PIVOTS = 2
+
+
+# =========================================================
+# 1. ЗАГРУЗКА ДАННЫХ MOEX
+# =========================================================
 
 def load_candles():
     result = []
@@ -27,7 +49,12 @@ def load_candles():
             "iss.meta": "off"
         }
 
-        response = requests.get(URL, params=params, timeout=30)
+        response = requests.get(
+            URL,
+            params=params,
+            timeout=30
+        )
+
         response.raise_for_status()
 
         block = response.json().get("candles", {})
@@ -37,11 +64,22 @@ def load_candles():
         if not data:
             break
 
-        result.extend(dict(zip(columns, row)) for row in data)
+        result.extend(
+            dict(zip(columns, row))
+            for row in data
+        )
+
         start += len(data)
 
-    return sorted(result, key=lambda x: x["begin"])
+    return sorted(
+        result,
+        key=lambda x: x["begin"]
+    )
 
+
+# =========================================================
+# 2. РАЗДЕЛЕНИЕ НА СЕССИИ
+# =========================================================
 
 def split_sessions(rows):
     sessions = []
@@ -49,10 +87,17 @@ def split_sessions(rows):
 
     for row in rows:
         if current:
-            previous = datetime.fromisoformat(current[-1]["begin"])
-            actual = datetime.fromisoformat(row["begin"])
+            previous = datetime.fromisoformat(
+                current[-1]["begin"]
+            )
 
-            minutes = (actual - previous).total_seconds() / 60
+            actual = datetime.fromisoformat(
+                row["begin"]
+            )
+
+            minutes = (
+                actual - previous
+            ).total_seconds() / 60
 
             if minutes > 10:
                 sessions.append(current)
@@ -66,12 +111,17 @@ def split_sessions(rows):
     return sessions
 
 
+# =========================================================
+# 3. АГРЕГАЦИЯ ТАЙМФРЕЙМОВ
+# =========================================================
+
 def aggregate_sessions(sessions, size):
     bars = []
 
     for session_id, session in enumerate(sessions, 1):
         for start in range(0, len(session), size):
             chunk = session[start:start + size]
+
             complete = len(chunk) == size
 
             bars.append({
@@ -79,10 +129,16 @@ def aggregate_sessions(sessions, size):
                 "begin": chunk[0]["begin"],
                 "end": chunk[-1]["end"],
                 "open": float(chunk[0]["open"]),
-                "high": max(float(x["high"]) for x in chunk),
-                "low": min(float(x["low"]) for x in chunk),
+                "high": max(
+                    float(x["high"]) for x in chunk
+                ),
+                "low": min(
+                    float(x["low"]) for x in chunk
+                ),
                 "close": float(chunk[-1]["close"]),
-                "volume": sum(float(x["volume"]) for x in chunk),
+                "volume": sum(
+                    float(x["volume"]) for x in chunk
+                ),
                 "source_count": len(chunk),
                 "is_complete": complete
             })
@@ -90,7 +146,276 @@ def aggregate_sessions(sessions, size):
     return bars
 
 
-def detect_pivots(bars, left=2, right=2, cross_sessions=False):
+# =========================================================
+# 4. EMA
+# =========================================================
+
+def calculate_ema(values, period):
+    result = [None] * len(values)
+
+    if len(values) < period:
+        return result
+
+    initial = sum(values[:period]) / period
+    result[period - 1] = initial
+
+    multiplier = 2 / (period + 1)
+    previous = initial
+
+    for i in range(period, len(values)):
+        current = (
+            values[i] * multiplier
+            + previous * (1 - multiplier)
+        )
+
+        result[i] = current
+        previous = current
+
+    return result
+
+
+# =========================================================
+# 5. RSI WILDER
+# =========================================================
+
+def calculate_rsi(values, period=14):
+    result = [None] * len(values)
+
+    if len(values) <= period:
+        return result
+
+    gains = []
+    losses = []
+
+    for i in range(1, period + 1):
+        change = values[i] - values[i - 1]
+
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+
+    average_gain = sum(gains) / period
+    average_loss = sum(losses) / period
+
+    def get_rsi(gain, loss):
+        if loss == 0:
+            return 100.0 if gain > 0 else 50.0
+
+        rs = gain / loss
+
+        return 100 - (100 / (1 + rs))
+
+    result[period] = get_rsi(
+        average_gain,
+        average_loss
+    )
+
+    for i in range(period + 1, len(values)):
+        change = values[i] - values[i - 1]
+
+        gain = max(change, 0)
+        loss = max(-change, 0)
+
+        average_gain = (
+            average_gain * (period - 1) + gain
+        ) / period
+
+        average_loss = (
+            average_loss * (period - 1) + loss
+        ) / period
+
+        result[i] = get_rsi(
+            average_gain,
+            average_loss
+        )
+
+    return result
+
+
+# =========================================================
+# 6. ATR WILDER
+# =========================================================
+
+def calculate_atr(bars, period=14):
+    result = [None] * len(bars)
+
+    if len(bars) <= period:
+        return result
+
+    true_ranges = []
+
+    for i, bar in enumerate(bars):
+        high = bar["high"]
+        low = bar["low"]
+
+        if i == 0:
+            tr = high - low
+        else:
+            previous_close = bars[i - 1]["close"]
+
+            tr = max(
+                high - low,
+                abs(high - previous_close),
+                abs(low - previous_close)
+            )
+
+        true_ranges.append(tr)
+
+    initial = sum(
+        true_ranges[1:period + 1]
+    ) / period
+
+    result[period] = initial
+    previous = initial
+
+    for i in range(period + 1, len(bars)):
+        current = (
+            previous * (period - 1)
+            + true_ranges[i]
+        ) / period
+
+        result[i] = current
+        previous = current
+
+    return result
+
+
+# =========================================================
+# 7. ИНДИКАТОРЫ И ОБЪЁМ
+# =========================================================
+
+def enrich_indicators(bars):
+    if not bars:
+        return bars
+
+    indices = [
+        i for i, bar in enumerate(bars)
+        if bar.get("is_complete", True)
+    ]
+
+    usable = [
+        bars[i] for i in indices
+    ]
+
+    if not usable:
+        return bars
+
+    closes = [
+        x["close"] for x in usable
+    ]
+
+    volumes = [
+        x["volume"] for x in usable
+    ]
+
+    ema20 = calculate_ema(
+        closes,
+        EMA_FAST
+    )
+
+    ema50 = calculate_ema(
+        closes,
+        EMA_SLOW
+    )
+
+    rsi = calculate_rsi(
+        closes,
+        RSI_PERIOD
+    )
+
+    atr = calculate_atr(
+        usable,
+        ATR_PERIOD
+    )
+
+    ema12 = calculate_ema(closes, 12)
+    ema26 = calculate_ema(closes, 26)
+
+    macd_line = [None] * len(usable)
+
+    for i in range(len(usable)):
+        if (
+            ema12[i] is not None
+            and ema26[i] is not None
+        ):
+            macd_line[i] = (
+                ema12[i] - ema26[i]
+            )
+
+    macd_signal = [None] * len(usable)
+
+    first_macd = next(
+        (
+            i for i, value in enumerate(macd_line)
+            if value is not None
+        ),
+        None
+    )
+
+    if first_macd is not None:
+        valid_macd = macd_line[first_macd:]
+
+        valid_signal = calculate_ema(
+            valid_macd,
+            9
+        )
+
+        for j, value in enumerate(valid_signal):
+            macd_signal[first_macd + j] = value
+
+    for j, original_index in enumerate(indices):
+        bar = bars[original_index]
+
+        # Средний объём предыдущих 20 свечей.
+        # Текущая свеча в среднее не включается.
+        if j >= VOLUME_PERIOD:
+            average_volume = sum(
+                volumes[j - VOLUME_PERIOD:j]
+            ) / VOLUME_PERIOD
+        else:
+            average_volume = None
+
+        if (
+            average_volume is not None
+            and average_volume > 0
+        ):
+            volume_ratio = (
+                volumes[j] / average_volume
+            )
+        else:
+            volume_ratio = None
+
+        macd = macd_line[j]
+        signal = macd_signal[j]
+
+        histogram = (
+            macd - signal
+            if macd is not None and signal is not None
+            else None
+        )
+
+        bar["ema20"] = ema20[j]
+        bar["ema50"] = ema50[j]
+        bar["rsi14"] = rsi[j]
+        bar["macd"] = macd
+        bar["macd_signal"] = signal
+        bar["macd_histogram"] = histogram
+        bar["atr14"] = atr[j]
+        bar["volume_sma20"] = average_volume
+        bar["volume_ratio20"] = volume_ratio
+
+    return bars
+
+
+# =========================================================
+# 8. ПОИСК ПОДТВЕРЖДЁННЫХ ЭКСТРЕМУМОВ
+# =========================================================
+
+def detect_pivots(
+    bars,
+    left=LEFT,
+    right=RIGHT,
+    cross_sessions=False
+):
     pivots = []
 
     if cross_sessions:
@@ -99,7 +424,10 @@ def detect_pivots(bars, left=2, right=2, cross_sessions=False):
             if x["is_complete"]
         ]]
     else:
-        session_ids = sorted(set(x["session_id"] for x in bars))
+        session_ids = sorted(
+            set(x["session_id"] for x in bars)
+        )
+
         sequences = []
 
         for session_id in session_ids:
@@ -108,23 +436,39 @@ def detect_pivots(bars, left=2, right=2, cross_sessions=False):
                 if x["session_id"] == session_id
                 and x["is_complete"]
             ]
+
             sequences.append(sequence)
 
     for sequence in sequences:
-        for i in range(left, len(sequence) - right):
+        for i in range(
+            left,
+            len(sequence) - right
+        ):
             bar = sequence[i]
 
             previous = sequence[i-left:i]
             following = sequence[i+1:i+right+1]
 
             is_high = (
-                all(bar["high"] > x["high"] for x in previous)
-                and all(bar["high"] > x["high"] for x in following)
+                all(
+                    bar["high"] > x["high"]
+                    for x in previous
+                )
+                and all(
+                    bar["high"] > x["high"]
+                    for x in following
+                )
             )
 
             is_low = (
-                all(bar["low"] < x["low"] for x in previous)
-                and all(bar["low"] < x["low"] for x in following)
+                all(
+                    bar["low"] < x["low"]
+                    for x in previous
+                )
+                and all(
+                    bar["low"] < x["low"]
+                    for x in following
+                )
             )
 
             confirmed_at = following[-1]["end"]
@@ -147,11 +491,21 @@ def detect_pivots(bars, left=2, right=2, cross_sessions=False):
                     "price": bar["low"]
                 })
 
-    return sorted(pivots, key=lambda x: (x["time"], x["type"]))
+    return sorted(
+        pivots,
+        key=lambda x: (x["time"], x["type"])
+    )
 
+
+# =========================================================
+# 9. КЛАССИФИКАЦИЯ ЭКСТРЕМУМОВ
+# =========================================================
 
 def classify_pivots(pivots):
-    previous = {"HIGH": None, "LOW": None}
+    previous = {
+        "HIGH": None,
+        "LOW": None
+    }
 
     for pivot in pivots:
         kind = pivot["type"]
@@ -159,10 +513,17 @@ def classify_pivots(pivots):
 
         if old is None:
             label = "FIRST"
+
         elif pivot["price"] > old:
-            label = "HH" if kind == "HIGH" else "HL"
+            label = (
+                "HH" if kind == "HIGH" else "HL"
+            )
+
         elif pivot["price"] < old:
-            label = "LH" if kind == "HIGH" else "LL"
+            label = (
+                "LH" if kind == "HIGH" else "LL"
+            )
+
         else:
             label = "EQUAL"
 
@@ -172,149 +533,466 @@ def classify_pivots(pivots):
     return pivots
 
 
-def classify_market(pivots):
-    highs = [p for p in pivots if p["type"] == "HIGH"]
-    lows = [p for p in pivots if p["type"] == "LOW"]
+# =========================================================
+# 10. ПОСТРОЕНИЕ КАРТЫ УРОВНЕЙ 4H
+# =========================================================
 
-    if len(highs) < 2 or len(lows) < 2:
-        return {
-            "state": "INSUFFICIENT_DATA",
-            "reason": "Нужно минимум два подтверждённых максимума и два минимума",
-            "highs": highs[-2:],
-            "lows": lows[-2:]
-        }
+def build_level_map(
+    pivots,
+    atr_value,
+    latest_price
+):
+    if atr_value is None or atr_value <= 0:
+        return [], None
 
-    high_old, high_new = highs[-2], highs[-1]
-    low_old, low_new = lows[-2], lows[-1]
+    tolerance = (
+        atr_value * ZONE_ATR_FACTOR
+    )
 
-    higher_highs = high_new["price"] > high_old["price"]
-    lower_highs = high_new["price"] < high_old["price"]
+    sorted_pivots = sorted(
+        pivots,
+        key=lambda x: x["price"]
+    )
 
-    higher_lows = low_new["price"] > low_old["price"]
-    lower_lows = low_new["price"] < low_old["price"]
+    clusters = []
+    current = []
 
-    if higher_highs and higher_lows:
-        state = "UPTREND"
-        reason = "Последние два максимума и минимума повышаются"
+    for pivot in sorted_pivots:
+        if not current:
+            current = [pivot]
+            continue
 
-    elif lower_highs and lower_lows:
-        state = "DOWNTREND"
-        reason = "Последние два максимума и минимума понижаются"
+        cluster_min = current[0]["price"]
 
-    elif lower_highs and higher_lows:
-        state = "COMPRESSION"
-        reason = "Максимумы снижаются, минимумы повышаются"
+        if (
+            pivot["price"] - cluster_min
+            <= tolerance
+        ):
+            current.append(pivot)
+        else:
+            clusters.append(current)
+            current = [pivot]
 
-    elif higher_highs and lower_lows:
-        state = "EXPANSION"
-        reason = "Максимумы повышаются, минимумы понижаются"
+    if current:
+        clusters.append(current)
 
-    else:
-        state = "TRANSITION"
-        reason = "Есть равные значения или неоднозначная структура"
+    zones = []
 
-    return {
-        "state": state,
-        "reason": reason,
-        "highs": [high_old, high_new],
-        "lows": [low_old, low_new]
-    }
+    for cluster in clusters:
+        if len(cluster) < MIN_ZONE_PIVOTS:
+            continue
 
+        prices = [
+            x["price"] for x in cluster
+        ]
 
-def print_market_state(name, result):
-    print(f"\n===== СОСТОЯНИЕ РЫНКА {name} =====")
-    print("Классификация:", result["state"])
-    print("Причина:", result["reason"])
+        center = median(prices)
 
-    print("\nПоследние два максимума:")
-    for p in result["highs"]:
-        print(
-            p["time"],
-            p["price"],
-            p.get("structure", ""),
-            "| подтверждён:", p["confirmed_at"]
+        zone_low = min(prices) - tolerance / 2
+        zone_high = max(prices) + tolerance / 2
+
+        high_count = sum(
+            x["type"] == "HIGH"
+            for x in cluster
         )
 
-    print("\nПоследние два минимума:")
-    for p in result["lows"]:
-        print(
-            p["time"],
-            p["price"],
-            p.get("structure", ""),
-            "| подтверждён:", p["confirmed_at"]
+        low_count = sum(
+            x["type"] == "LOW"
+            for x in cluster
         )
 
+        latest_confirmation = max(
+            x["confirmed_at"]
+            for x in cluster
+        )
+
+        if latest_price > zone_high:
+            position = "BELOW_PRICE_SUPPORT"
+
+        elif latest_price < zone_low:
+            position = "ABOVE_PRICE_RESISTANCE"
+
+        else:
+            position = "PRICE_INSIDE_ZONE"
+
+        zones.append({
+            "zone_id": len(zones) + 1,
+            "zone_low": round(zone_low, 2),
+            "zone_high": round(zone_high, 2),
+            "center": round(center, 2),
+            "pivot_count": len(cluster),
+            "high_count": high_count,
+            "low_count": low_count,
+            "last_confirmation": latest_confirmation,
+            "position": position,
+            "distance_points": round(
+                center - latest_price,
+                2
+            ),
+            "distance_atr": round(
+                (center - latest_price) / atr_value,
+                3
+            )
+        })
+
+    zones.sort(
+        key=lambda x: abs(x["distance_points"])
+    )
+
+    return zones, tolerance
+
+
+# =========================================================
+# 11. КОНТЕКСТ 1H ОТНОСИТЕЛЬНО УРОВНЕЙ
+# =========================================================
+
+def print_1h_context(bars, zones):
+    complete = [
+        x for x in bars
+        if x["is_complete"]
+    ]
+
+    if not complete:
+        print("Нет полных свечей 1H")
+        return
+
+    last = complete[-1]
+    price = last["close"]
+
+    print("\n===== КОНТЕКСТ 1H =====")
+    print("Время:", last["end"])
+    print("Цена закрытия:", price)
+    print("EMA20:", last["ema20"])
+    print("EMA50:", last["ema50"])
+    print("RSI14:", last["rsi14"])
+    print("MACD:", last["macd"])
+    print("MACD signal:", last["macd_signal"])
+    print("MACD histogram:", last["macd_histogram"])
+    print("ATR14:", last["atr14"])
+    print("Объём:", last["volume"])
+    print(
+        "Средний объём предыдущих 20:",
+        last["volume_sma20"]
+    )
+    print(
+        "Объём / средний:",
+        last["volume_ratio20"]
+    )
+
+    if last["ema20"] is not None:
+        print(
+            "Цена относительно EMA20:",
+            "ВЫШЕ" if price > last["ema20"]
+            else "НИЖЕ" if price < last["ema20"]
+            else "НА EMA20"
+        )
+
+    if last["ema50"] is not None:
+        print(
+            "Цена относительно EMA50:",
+            "ВЫШЕ" if price > last["ema50"]
+            else "НИЖЕ" if price < last["ema50"]
+            else "НА EMA50"
+        )
+
+    print("\nБЛИЖАЙШИЕ УРОВНИ 4H ПО ЦЕНЕ 1H:")
+
+    if not zones:
+        print("Нет зон, прошедших фильтр")
+        return
+
+    nearest = sorted(
+        zones,
+        key=lambda z: abs(z["center"] - price)
+    )
+
+    for zone in nearest[:5]:
+        if price > zone["zone_high"]:
+            position = (
+                "НИЖЕ ЦЕНЫ — ПОТЕНЦИАЛЬНАЯ ПОДДЕРЖКА"
+            )
+
+        elif price < zone["zone_low"]:
+            position = (
+                "ВЫШЕ ЦЕНЫ — ПОТЕНЦИАЛЬНОЕ СОПРОТИВЛЕНИЕ"
+            )
+
+        else:
+            position = "ЦЕНА ВНУТРИ ЗОНЫ"
+
+        distance = zone["center"] - price
+
+        print(
+            f'Зона {zone["zone_low"]} - {zone["zone_high"]}',
+            f'| центр={zone["center"]}',
+            f'| экстремумов={zone["pivot_count"]}',
+            f'| расстояние={round(distance, 2)}',
+            f'| положение={position}'
+        )
+
+
+# =========================================================
+# 12. СОХРАНЕНИЕ CSV
+# =========================================================
 
 def save_csv(filename, rows):
     if not rows:
         print("Нет данных:", filename)
         return
 
-    with open(filename, "w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
+    with open(
+        filename,
+        "w",
+        newline="",
+        encoding="utf-8-sig"
+    ) as file:
+
+        writer = csv.DictWriter(
+            file,
+            fieldnames=list(rows[0].keys())
+        )
+
         writer.writeheader()
         writer.writerows(rows)
 
 
-def main():
-    print("АНАЛИЗ СТРУКТУРЫ MXZ6 — MARKET STATE V2.0")
+# =========================================================
+# 13. ВЫВОД ИНДИКАТОРОВ
+# =========================================================
 
-    candles = load_candles()
-    sessions = split_sessions(candles)
-
-    print("Исходных свечей:", len(candles))
-    print("Торговых сессий:", len(sessions))
-
-    timeframes = [
-        ("30M", 3, False),
-        ("1H", 6, False),
-        ("4H", 24, True)
+def print_latest_indicators(name, bars):
+    complete = [
+        x for x in bars
+        if x.get("is_complete", True)
     ]
 
-    for name, size, cross_sessions in timeframes:
-        bars = aggregate_sessions(sessions, size)
+    if not complete:
+        return
 
-        pivots = detect_pivots(
-            bars,
-            left=2,
-            right=2,
-            cross_sessions=cross_sessions
+    last = complete[-1]
+
+    print(f"\n===== ИНДИКАТОРЫ {name} =====")
+    print("Время:", last["end"])
+    print("Close:", last["close"])
+    print("EMA20:", last["ema20"])
+    print("EMA50:", last["ema50"])
+    print("RSI14:", last["rsi14"])
+    print("MACD:", last["macd"])
+    print("MACD signal:", last["macd_signal"])
+    print("MACD histogram:", last["macd_histogram"])
+    print("ATR14:", last["atr14"])
+    print("Volume:", last["volume"])
+    print("Volume SMA20:", last["volume_sma20"])
+    print("Volume ratio:", last["volume_ratio20"])
+
+
+# =========================================================
+# 14. MAIN
+# =========================================================
+
+def main():
+    print("=" * 60)
+    print("MIX LEVEL MAP V1.0")
+    print("Инструмент:", SECID)
+    print("Период:", DATE_FROM, "-", DATE_TILL)
+    print("=" * 60)
+
+    candles = load_candles()
+
+    if not candles:
+        print("MOEX не вернула свечи")
+        return
+
+    sessions = split_sessions(candles)
+
+    print("\nИсходных свечей:", len(candles))
+    print("Торговых сессий:", len(sessions))
+
+    # 10M
+    bars_10m = [
+        {
+            "begin": x["begin"],
+            "end": x["end"],
+            "open": float(x["open"]),
+            "high": float(x["high"]),
+            "low": float(x["low"]),
+            "close": float(x["close"]),
+            "volume": float(x["volume"]),
+            "is_complete": True
+        }
+        for x in candles
+    ]
+
+    bars_10m = enrich_indicators(bars_10m)
+
+    # Агрегация
+    bars_30m = aggregate_sessions(sessions, 3)
+    bars_1h = aggregate_sessions(sessions, 6)
+    bars_4h = aggregate_sessions(sessions, 24)
+
+    # Индикаторы
+    bars_30m = enrich_indicators(bars_30m)
+    bars_1h = enrich_indicators(bars_1h)
+    bars_4h = enrich_indicators(bars_4h)
+
+    # Экстремумы
+    pivots_30m = classify_pivots(
+        detect_pivots(
+            bars_30m,
+            cross_sessions=False
         )
+    )
 
-        pivots = classify_pivots(pivots)
-        market_state = classify_market(pivots)
-
-        complete_count = sum(x["is_complete"] for x in bars)
-        partial_count = len(bars) - complete_count
-
-        filename = f"MXZ6_{name}_PIVOTS_V2.csv"
-        save_csv(filename, pivots)
-
-        print(f"\n===== {name} =====")
-        print("Всего баров:", len(bars))
-        print("Полных:", complete_count)
-        print("Неполных:", partial_count)
-        print(
-            "Режим поиска:",
-            "между сессиями разрешён" if cross_sessions
-            else "только внутри сессии"
+    pivots_1h = classify_pivots(
+        detect_pivots(
+            bars_1h,
+            cross_sessions=False
         )
-        print("Максимумов:", sum(x["type"] == "HIGH" for x in pivots))
-        print("Минимумов:", sum(x["type"] == "LOW" for x in pivots))
+    )
 
-        print_market_state(name, market_state)
+    pivots_4h = classify_pivots(
+        detect_pivots(
+            bars_4h,
+            cross_sessions=True
+        )
+    )
 
-        print("\nПоследние 15 экстремумов:")
-        for p in pivots[-15:]:
+    complete_4h = [
+        x for x in bars_4h
+        if x["is_complete"]
+    ]
+
+    complete_1h = [
+        x for x in bars_1h
+        if x["is_complete"]
+    ]
+
+    if not complete_4h or not complete_1h:
+        print("Недостаточно полных свечей")
+        return
+
+    last_4h = complete_4h[-1]
+    last_1h = complete_1h[-1]
+
+    # Текущая карта уровней
+    zones, tolerance = build_level_map(
+        pivots_4h,
+        last_4h["atr14"],
+        last_4h["close"]
+    )
+
+    print("\n===== КОНТРОЛЬ ДАННЫХ =====")
+    print("Последняя 10M свеча:", candles[-1]["begin"])
+    print("Последняя полная 1H:", last_1h["end"])
+    print("Последняя полная 4H:", last_4h["end"])
+
+    print("\n===== 4H LEVEL MAP =====")
+    print("Полных свечей 4H:", len(complete_4h))
+    print(
+        "Подтверждённых максимумов:",
+        sum(x["type"] == "HIGH" for x in pivots_4h)
+    )
+    print(
+        "Подтверждённых минимумов:",
+        sum(x["type"] == "LOW" for x in pivots_4h)
+    )
+    print("Цена 4H:", last_4h["close"])
+    print("ATR14 4H:", last_4h["atr14"])
+    print("Допуск объединения зон:", tolerance)
+
+    print("\nНАЙДЕННЫЕ ЗНАЧИМЫЕ ЗОНЫ:")
+
+    if not zones:
+        print("Зоны не найдены")
+    else:
+        for zone in zones:
             print(
-                p["time"],
-                p["type"],
-                p["price"],
-                p["structure"],
-                "| подтверждён:", p["confirmed_at"]
+                f'#{zone["zone_id"]}',
+                f'{zone["zone_low"]} - {zone["zone_high"]}',
+                f'центр={zone["center"]}',
+                f'экстремумов={zone["pivot_count"]}',
+                f'максимумов={zone["high_count"]}',
+                f'минимумов={zone["low_count"]}',
+                f'положение={zone["position"]}',
+                f'подтверждена={zone["last_confirmation"]}'
             )
 
-        print("Файл:", filename)
+    print_1h_context(
+        bars_1h,
+        zones
+    )
+
+    print_latest_indicators(
+        "30M",
+        bars_30m
+    )
+
+    print_latest_indicators(
+        "10M",
+        bars_10m
+    )
+
+    print_latest_indicators(
+        "4H",
+        bars_4h
+    )
+
+    # Сохранение файлов
+    save_csv(
+        f"{SECID}_4H_PIVOTS_V1.csv",
+        pivots_4h
+    )
+
+    save_csv(
+        f"{SECID}_1H_PIVOTS_V1.csv",
+        pivots_1h
+    )
+
+    save_csv(
+        f"{SECID}_30M_PIVOTS_V1.csv",
+        pivots_30m
+    )
+
+    save_csv(
+        f"{SECID}_4H_LEVEL_MAP_V1.csv",
+        zones
+    )
+
+    save_csv(
+        f"{SECID}_4H_INDICATORS_V1.csv",
+        complete_4h
+    )
+
+    save_csv(
+        f"{SECID}_1H_INDICATORS_V1.csv",
+        complete_1h
+    )
+
+    save_csv(
+        f"{SECID}_30M_INDICATORS_V1.csv",
+        [
+            x for x in bars_30m
+            if x["is_complete"]
+        ]
+    )
+
+    save_csv(
+        f"{SECID}_10M_INDICATORS_V1.csv",
+        bars_10m
+    )
+
+    print("\n===== ФАЙЛЫ СОХРАНЕНЫ =====")
+    print("4H_LEVEL_MAP")
+    print("4H_PIVOTS")
+    print("1H_PIVOTS")
+    print("30M_PIVOTS")
+    print("4H_INDICATORS")
+    print("1H_INDICATORS")
+    print("30M_INDICATORS")
+    print("10M_INDICATORS")
+
+    print("\nАНАЛИЗ ЗАВЕРШЁН")
+    print("Торговые сигналы не формировались.")
 
 
 if __name__ == "__main__":
