@@ -90,28 +90,35 @@ def aggregate_sessions(sessions, size):
     return bars
 
 
-def detect_pivots(bars, left=2, right=2):
+def detect_pivots(bars, left=2, right=2, cross_sessions=False):
     pivots = []
 
-    # Анализируем каждую сессию отдельно.
-    session_ids = sorted(set(x["session_id"] for x in bars))
-
-    for session_id in session_ids:
-        session = [
+    if cross_sessions:
+        # 4H: все полные бары в общей хронологической последовательности.
+        sequences = [[
             x for x in bars
-            if x["session_id"] == session_id
-        ]
-
-        complete = [
-            x for x in session
             if x["is_complete"]
-        ]
+        ]]
+    else:
+        # 1H: полные бары анализируются отдельно внутри каждой сессии.
+        session_ids = sorted(set(x["session_id"] for x in bars))
 
-        for i in range(left, len(complete) - right):
-            bar = complete[i]
+        sequences = []
 
-            previous = complete[i-left:i]
-            following = complete[i+1:i+right+1]
+        for session_id in session_ids:
+            sequence = [
+                x for x in bars
+                if x["session_id"] == session_id
+                and x["is_complete"]
+            ]
+            sequences.append(sequence)
+
+    for sequence in sequences:
+        for i in range(left, len(sequence) - right):
+            bar = sequence[i]
+
+            previous = sequence[i-left:i]
+            following = sequence[i+1:i+right+1]
 
             is_high = (
                 all(bar["high"] > x["high"] for x in previous)
@@ -127,7 +134,7 @@ def detect_pivots(bars, left=2, right=2):
 
             if is_high:
                 pivots.append({
-                    "session_id": session_id,
+                    "session_id": bar["session_id"],
                     "type": "HIGH",
                     "time": bar["begin"],
                     "confirmed_at": confirmed_at,
@@ -136,14 +143,17 @@ def detect_pivots(bars, left=2, right=2):
 
             if is_low:
                 pivots.append({
-                    "session_id": session_id,
+                    "session_id": bar["session_id"],
                     "type": "LOW",
                     "time": bar["begin"],
                     "confirmed_at": confirmed_at,
                     "price": bar["low"]
                 })
 
-    return sorted(pivots, key=lambda x: x["time"])
+    return sorted(
+        pivots,
+        key=lambda x: (x["time"], x["type"])
+    )
 
 
 def classify_pivots(pivots):
@@ -180,7 +190,7 @@ def save_csv(filename, rows):
 
 
 def main():
-    print("ИСПРАВЛЕННЫЙ АНАЛИЗ СТРУКТУРЫ", SECID)
+    print("АНАЛИЗ СТРУКТУРЫ MXZ6 — VERSION 2")
 
     candles = load_candles()
     sessions = split_sessions(candles)
@@ -190,18 +200,32 @@ def main():
 
     for name, size in [("1H", 6), ("4H", 24)]:
         bars = aggregate_sessions(sessions, size)
-        pivots = classify_pivots(detect_pivots(bars))
+
+        cross_sessions = (name == "4H")
+
+        pivots = detect_pivots(
+            bars,
+            left=2,
+            right=2,
+            cross_sessions=cross_sessions
+        )
+
+        pivots = classify_pivots(pivots)
 
         complete_count = sum(x["is_complete"] for x in bars)
         partial_count = len(bars) - complete_count
 
-        filename = f"MXZ6_{name}_PIVOTS_FIXED.csv"
+        filename = f"MXZ6_{name}_PIVOTS_V2.csv"
         save_csv(filename, pivots)
 
         print(f"\n===== {name} =====")
         print("Всего баров:", len(bars))
         print("Полных:", complete_count)
         print("Неполных:", partial_count)
+        print("Режим поиска:", 
+              "между сессиями разрешён" if cross_sessions
+              else "только внутри сессии")
+
         print("Максимумов:", sum(x["type"] == "HIGH" for x in pivots))
         print("Минимумов:", sum(x["type"] == "LOW" for x in pivots))
 
