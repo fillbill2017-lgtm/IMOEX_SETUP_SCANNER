@@ -28,3 +28,13 @@ jobs:
 
       - name: Run IMOEX data test
         run: python main.py
+
+      - name: Upload V1.3 CSV files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIX-LEVEL-MAP-V1.3
+          path: |
+            **/MXZ6_SEQUENTIAL_4H_LEVEL_HISTORY_V1_3.csv
+            **/MXZ6_4H_PIVOT_AVAILABILITY_AUDIT_V1_3.csv
+          if-no-files-found: error
