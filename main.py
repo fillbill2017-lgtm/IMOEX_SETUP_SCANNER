@@ -1,8 +1,8 @@
 
 import requests
 import csv
-from collections import Counter
 from datetime import datetime
+from collections import Counter, defaultdict
 
 SECID = "MXZ6"
 DATE_FROM = "2026-10-01"
@@ -37,95 +37,71 @@ def load_candles():
         response = requests.get(URL, params=params, timeout=30)
         response.raise_for_status()
 
-        result = response.json()
-        block = result.get("candles", {})
+        block = response.json().get("candles", {})
         columns = block.get("columns", [])
         rows = block.get("data", [])
 
         if not rows:
             break
 
-        for row in rows:
-            all_rows.append(dict(zip(columns, row)))
-
-        print(
-            f"Получено: {len(all_rows)} свечей",
-            f"| следующая позиция: {start + len(rows)}"
-        )
-
+        all_rows.extend(dict(zip(columns, row)) for row in rows)
         start += len(rows)
 
-    return all_rows
+    return sorted(all_rows, key=lambda x: x["begin"])
 
 
 def main():
-    print("ЗАГРУЗКА ИСТОРИИ MIX")
-    print("Контракт:", SECID)
-    print("Период:", DATE_FROM, "-", DATE_TILL)
+    print("ПРОВЕРКА ВРЕМЕННОЙ НЕПРЕРЫВНОСТИ MXZ6")
 
     rows = load_candles()
 
     if not rows:
-        print("ОШИБКА: свечи не получены")
+        print("Свечи не получены")
         return
 
-    rows.sort(key=lambda x: x["begin"])
-
-    begins = [row["begin"] for row in rows]
-    duplicates = len(begins) - len(set(begins))
-
-    invalid_ohlc = 0
-    zero_volume = 0
-    total_volume = 0
-    trading_days = set()
+    daily = defaultdict(int)
+    gaps = []
+    gap_frequency = Counter()
 
     for row in rows:
-        o = float(row["open"])
-        h = float(row["high"])
-        l = float(row["low"])
-        c = float(row["close"])
-        v = float(row["volume"])
+        daily[row["begin"][:10]] += 1
 
-        if h < max(o, c, l) or l > min(o, c, h):
-            invalid_ohlc += 1
+    for previous, current in zip(rows, rows[1:]):
+        t1 = datetime.fromisoformat(previous["begin"])
+        t2 = datetime.fromisoformat(current["begin"])
 
-        if v == 0:
-            zero_volume += 1
+        minutes = int((t2 - t1).total_seconds() / 60)
 
-        total_volume += v
-        trading_days.add(row["begin"][:10])
+        if minutes > INTERVAL:
+            gap = {
+                "date": t1.date().isoformat(),
+                "from": t1.strftime("%H:%M"),
+                "to": t2.strftime("%H:%M"),
+                "minutes": minutes
+            }
+            gaps.append(gap)
+            gap_frequency[minutes] += 1
 
-    filename = (
-        f"{SECID}_{INTERVAL}m_"
-        f"{DATE_FROM}_{DATE_TILL}.csv"
-    )
+    print("\n===== СВЕЧИ ПО ДНЯМ =====")
+    for day in sorted(daily):
+        print(day, daily[day])
 
-    with open(filename, "w", newline="", encoding="utf-8-sig") as file:
-        writer = csv.DictWriter(file, fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+    print("\n===== ПРОМЕЖУТКИ ДЛИННЕЕ 10 МИНУТ =====")
+    print("Всего промежутков:", len(gaps))
 
-    print("\n===== КОНТРОЛЬ КАЧЕСТВА =====")
-    print("Всего свечей:", len(rows))
-    print("Первaя свеча:", rows[0]["begin"])
-    print("Последняя свеча:", rows[-1]["begin"])
-    print("Торговых дат:", len(trading_days))
-    print("Дубликатов:", duplicates)
-    print("Некорректных OHLC:", invalid_ohlc)
-    print("Свечей с нулевым объёмом:", zero_volume)
-    print("Суммарный объём:", int(total_volume))
-    print("Файл сохранён:", filename)
-
-    print("\nПоследние 10 свечей:")
-    for row in rows[-10:]:
+    for gap in gaps:
         print(
-            row["begin"],
-            "O:", row["open"],
-            "H:", row["high"],
-            "L:", row["low"],
-            "C:", row["close"],
-            "V:", row["volume"]
+            gap["date"],
+            gap["from"], "->", gap["to"],
+            "| минут:", gap["minutes"]
         )
+
+    print("\n===== ЧАСТОТА ДЛИТЕЛЬНОСТИ ПРОМЕЖУТКОВ =====")
+    for minutes, count in sorted(gap_frequency.items()):
+        print(f"{minutes} минут: {count}")
+
+    print("\nВсего свечей:", len(rows))
+    print("Торговых дат:", len(daily))
 
 
 if __name__ == "__main__":
